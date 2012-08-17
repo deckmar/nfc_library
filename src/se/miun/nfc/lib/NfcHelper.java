@@ -3,11 +3,14 @@ package se.miun.nfc.lib;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Locale;
+import java.util.UUID;
 
+import se.miun.nfc.lib.listeners.NfcBluetoothListener;
 import se.miun.nfc.lib.listeners.NfcTagListener;
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.content.Intent;
 import android.net.Uri;
 import android.nfc.NdefMessage;
@@ -16,6 +19,7 @@ import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.nfc.tech.Ndef;
 import android.nfc.tech.NdefFormatable;
+import android.util.Log;
 
 public class NfcHelper {
 
@@ -28,6 +32,14 @@ public class NfcHelper {
 	public final int NFCLIB_STATE_LISTEN_ALL_TAGS = 1;
 
 	protected int nfclib_state = NFCLIB_STATE_DEFAULT;
+
+	/**
+	 * Attributes for Bluetooth handover
+	 */
+	private BluetoothHandoverManager mBtHandoverManager;
+	private Uri appApkUri;
+	private UUID appUuid;
+	private String mOtherBluetoothAddress;
 
 	/**
 	 * Properties and their default settings
@@ -109,7 +121,7 @@ public class NfcHelper {
 		if (!deviceHasNfc()) {
 			return;
 		}
-		
+
 		Tag tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG);
 		String action = intent.getAction();
 		if (NfcAdapter.ACTION_NDEF_DISCOVERED.equals(action)) {
@@ -130,7 +142,23 @@ public class NfcHelper {
 	}
 
 	protected void handleNdef(Ndef ndefTech, NdefMessage ndefMessage) {
-		this.listener.nfcDiscoverNdef(ndefTech, ndefMessage, this.callbackFlag);
+		/**
+		 * If this is a Bluetooth handover request: handle it.
+		 * 
+		 * Otherwise pass is along to the original Nfc library.
+		 */
+		NdefRecord[] records = ndefMessage.getRecords();
+		if (records.length == 4 && "NfcToBluetoothHandoverRequest".equals(this.extractTextFromTextRecord(records[1]))) {
+
+			mOtherBluetoothAddress = this.extractTextFromTextRecord(records[2]);
+			pairBluetoothIfAppropriate();
+		} else {
+			this.listener.nfcDiscoverNdef(ndefTech, ndefMessage, this.callbackFlag);
+		}
+	}
+	
+	public void handleFakeNdef(Ndef ndefTech, NdefMessage ndefMessage) {
+		this.handleNdef(ndefTech, ndefMessage);
 	}
 
 	/**
@@ -140,7 +168,7 @@ public class NfcHelper {
 
 	@SuppressWarnings("unused")
 	public boolean writeNdefMessage(Tag tag, NdefMessage ndefMessage) {
-		
+
 		if (!deviceHasNfc()) {
 			return false;
 		}
@@ -174,7 +202,7 @@ public class NfcHelper {
 		if (!deviceHasNfc()) {
 			return false;
 		}
-		
+
 		NdefMessage ndef = makeNdefMessageFromUriAndStringMap(apkUri, dataKeyValues);
 		return writeNdefMessage(tag, ndef);
 	}
@@ -256,5 +284,119 @@ public class NfcHelper {
 		}
 
 		return new String(hex);
+	}
+
+	/**
+	 * Methods for making Bluetooth handover
+	 */
+	public void enableNfcToBluetoothHandover(Uri appApkUri, UUID appUniqueId, NfcBluetoothListener listener) {
+		this.appApkUri = appApkUri;
+		this.appUuid = appUniqueId;
+		mBtHandoverManager = new BluetoothHandoverManager(listener, nfcAdapter, appUuid);
+		mBtHandoverManager.activateBluetooth();
+	}
+
+	public void startNfcToBluetoothServer() {
+		if (this.appUuid == null) {
+			throw new IllegalArgumentException("First run enableNfcToBluetoothHandover");
+		}
+		NdefMessage ndefMessage = makeBTHandoverNdef();
+		mBtHandoverManager.listenForConnection();
+		if (deviceHasNfc()) {
+			this.nfcAdapter.enableForegroundNdefPush(app, ndefMessage);
+		}
+	}
+
+	private NdefMessage makeBTHandoverNdef() {
+		NdefMessage ndef = new NdefMessage(new NdefRecord[] {
+				// First the APK URI to the app using this library
+				this.makeNdefRecordFromUri(appApkUri),
+				// The string "NfcToBluetoothHandoverRequest" to identify this
+				// request
+				this.makeNdefRecordFromText("NfcToBluetoothHandoverRequest"),
+				// This device's Bluetooth hardware address
+				this.makeNdefRecordFromText(mBtHandoverManager.getBluetoothHardwareAddress()),
+				// A UUID unique for the app using this lib
+				this.makeNdefRecordFromText(this.appUuid.toString())
+
+		});
+		return ndef;
+	}
+
+	// @Override
+	// public void onNdefPushComplete(NfcEvent event) {
+	// switch (mNfcToBTState) {
+	// case NFCLIB_STATE_NFC2BT_REQUESTED:
+	// mNfcToBTState++;
+	// break;
+	// case NFCLIB_STATE_NFC2BT_HALFREADY:
+	// pairBluetoothIfAppropriate();
+	// break;
+	// }
+	// }
+
+	public void ensureDiscoverable() {
+		if (mBtHandoverManager.getBTAdapter().getScanMode() != BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
+			Intent discoverableIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
+			discoverableIntent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300);
+			this.app.startActivity(discoverableIntent);
+		}
+	}
+
+	public void startDiscovery() {
+		mBtHandoverManager.getBTAdapter().startDiscovery();
+	}
+
+	private void pairBluetoothIfAppropriate() {
+
+		BluetoothDevice device = mBtHandoverManager.getBluetoothDeviceFromAddress(mOtherBluetoothAddress);
+		Log.d(TAG, "getBondState: " + device.getBondState());
+		mBtHandoverManager.connect(device);
+	}
+
+	public void write(String message) {
+
+		if (!message.endsWith("\n")) {
+			message += "\n";
+		}
+		mBtHandoverManager.write(message.getBytes());
+	}
+
+	/***
+	 * Builder-class simplifying the creation and writing of NdefMessages.
+	 * 
+	 * @author JohnDoe
+	 * 
+	 */
+	public static class MessageBuilder {
+		NdefMessage mNdefMessage;
+		ArrayList<NdefRecord> mNdefRecords;
+		private NfcHelper mNfcHelper;
+
+		public MessageBuilder(NfcHelper nfcHelper) {
+			mNdefRecords = new ArrayList<NdefRecord>();
+			mNfcHelper = nfcHelper;
+		}
+
+		public MessageBuilder addUri(Uri uri) {
+			mNdefRecords.add(mNfcHelper.makeNdefRecordFromUri(uri));
+			return this;
+		}
+
+		public MessageBuilder addText(String txt) {
+			mNdefRecords.add(mNfcHelper.makeNdefRecordFromText(txt));
+			return this;
+		}
+
+		public NdefMessage create() {
+			NdefRecord[] records = mNdefRecords.toArray(new NdefRecord[0]);
+			mNdefMessage = new NdefMessage(records);
+			return mNdefMessage;
+		}
+
+		public void write(Tag tag) {
+			create();
+			mNfcHelper.writeNdefMessage(tag, mNdefMessage);
+		}
 	}
 }
